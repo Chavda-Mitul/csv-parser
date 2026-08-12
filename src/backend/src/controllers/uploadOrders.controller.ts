@@ -87,18 +87,26 @@ export const uploadOrders = asyncHandler((req, res) => {
         successfulRows++;
         const targetShardIdx = shardBuffers.add(result.data);
 
+        const handleFlushError = (error: unknown) => {
+          logger.error(error, "Failed to bulk insert order batch");
+          gcsStream.destroy();
+          csvStream.destroy();
+          settle(() =>
+            reject(new AppError(502, "Failed to write orders to database")),
+          );
+        };
+
         if (shardBuffers.isFull(targetShardIdx)) {
+          shardBuffers.flushAsync(targetShardIdx).catch(handleFlushError);
+        }
+
+        if (shardBuffers.needsBackpressure(targetShardIdx)) {
           csvStream.pause();
           shardBuffers
-            .flush(targetShardIdx)
+            .waitFor(targetShardIdx)
             .then(() => csvStream.resume())
-            .catch((error: unknown) => {
-              logger.error(error, "Failed to bulk insert order batch");
-              gcsStream.destroy();
-              csvStream.destroy();
-              settle(() =>
-                reject(new AppError(502, "Failed to write orders to database")),
-              );
+            .catch(() => {
+              // already handled by handleFlushError above
             });
         }
       });
