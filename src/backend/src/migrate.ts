@@ -1,20 +1,21 @@
 import { readdirSync, readFileSync } from "fs";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
+import type { Pool } from "pg";
 import { shardPools } from "./db/pool.js";
 import { logger } from "./logger.js";
 
 const migrationsDir = join(
   dirname(fileURLToPath(import.meta.url)),
   "..",
-  "migrations"
+  "migrations",
 );
 
 const migrations = readdirSync(migrationsDir)
   .filter((file) => file.endsWith(".sql"))
   .sort();
 
-async function migrateShard(pool: any, shardIndex: number) {
+async function migrateShard(pool: Pool, shardIndex: number) {
   const client = await pool.connect();
 
   try {
@@ -27,9 +28,7 @@ async function migrateShard(pool: any, shardIndex: number) {
     `);
 
     // Get already applied migrations
-    const { rows } = await client.query(
-      "SELECT name FROM schema_migrations"
-    );
+    const { rows } = await client.query("SELECT name FROM schema_migrations");
 
     const applied = new Set(rows.map((row: { name: string }) => row.name));
 
@@ -41,20 +40,16 @@ async function migrateShard(pool: any, shardIndex: number) {
 
       logger.info({ shardIndex, migration }, "Applying migration");
 
-      const sql = readFileSync(
-        join(migrationsDir, migration),
-        "utf8"
-      );
+      const sql = readFileSync(join(migrationsDir, migration), "utf8");
 
       await client.query("BEGIN");
 
       try {
         await client.query(sql);
 
-        await client.query(
-          "INSERT INTO schema_migrations (name) VALUES ($1)",
-          [migration]
-        );
+        await client.query("INSERT INTO schema_migrations (name) VALUES ($1)", [
+          migration,
+        ]);
 
         await client.query("COMMIT");
 
@@ -75,9 +70,7 @@ async function migrate() {
   try {
     // Run all shards in parallel
     await Promise.all(
-      shardPools.map((pool, index) =>
-        migrateShard(pool, index)
-      )
+      shardPools.map((pool, index) => migrateShard(pool, index)),
     );
     logger.info("All shards migrated successfully");
   } catch (error) {
@@ -85,9 +78,7 @@ async function migrate() {
     process.exit(1);
   } finally {
     // Close all database pools
-    await Promise.all(
-      shardPools.map((pool) => pool.end())
-    );
+    await Promise.all(shardPools.map((pool) => pool.end()));
   }
 }
 
