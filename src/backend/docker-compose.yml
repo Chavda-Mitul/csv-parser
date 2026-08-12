@@ -1,0 +1,66 @@
+version: '3.8'
+
+services:
+  # Node.js Application API Service
+  app:
+    build: .
+    container_name: orders_backend_app
+    ports:
+      - "3000:3000"
+    environment:
+      - PORT=3000
+      - GCS_BUCKET_NAME=csv-orders-bucket-mitul-2026
+      - GCP_PROJECT_ID=project-e0877da6-3d8f-478e-9d0
+      - SHARD_1_URL=postgresql://postgres:postgrespassword@postgres_shard_1:5432/shard_1
+      - SHARD_2_URL=postgresql://postgres:postgrespassword@postgres_shard_2:5432/shard_2
+      - SHARD_3_URL=postgresql://postgres:postgrespassword@postgres_shard_3:5432/shard_3
+    volumes:
+      - ~/.config/gcloud:/root/.config/gcloud:ro # Mounts ADC credentials into the container
+    depends_on:
+      - postgres_shard_1
+      - postgres_shard_2
+      - postgres_shard_3
+
+  # Shard 1 Instance
+  postgres_shard_1:
+    image: postgres:15-alpine
+    container_name: postgres_shard_1
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgrespassword
+      POSTGRES_DB: shard_1
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_shard_1_data:/var/lib/postgresql/data
+
+  # Shard 2 Instance
+  postgres_shard_2:
+    image: postgres:15-alpine
+    container_name: postgres_shard_2
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgrespassword
+      POSTGRES_DB: shard_2
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_shard_2_data:/var/lib/postgresql/data
+
+  # Shard 3 Instance
+  postgres_shard_3:
+    image: postgres:15-alpine
+    container_name: postgres_shard_3
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgrespassword
+      POSTGRES_DB: shard_3
+    ports:
+      - "5434:5432"
+    volumes:
+      - postgres_shard_3_data:/var/lib/postgresql/data
+
+volumes:
+  postgres_shard_1_data:
+  postgres_shard_2_data:
+  postgres_shard_3_data:
