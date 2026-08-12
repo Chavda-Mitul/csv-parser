@@ -1,17 +1,15 @@
 import Busboy from "busboy";
 import { randomUUID } from "crypto";
-import { z } from "zod";
+import { PassThrough } from "stream";
+import { parse } from "fast-csv";
 import { bucket } from "../gcloud/bucket.js";
 import { logger } from "../logger.js";
 import { AppError } from "../errors/AppError.js";
 import { asyncHandler } from "../middleware/asyncHandler.js";
+import { fileInfoSchema, orderRowSchema } from "../validation/orderRow.js";
+import { ShardBufferManager } from "../services/shardBuffer.service.js";
 
 const MAX_FILE_BYTES = 50 * 1024 * 1024; // 50MB
-
-const fileInfoSchema = z.object({
-  filename: z.string().toLowerCase().endsWith(".csv"),
-  mimeType: z.enum(["text/csv", "application/vnd.ms-excel", "application/csv"]),
-});
 
 export const uploadOrders = asyncHandler((req, res) => {
   return new Promise<void>((resolve, reject) => {
@@ -44,12 +42,76 @@ export const uploadOrders = asyncHandler((req, res) => {
       const { filename, mimeType } = parsed.data;
 
       const destination = `orders/${randomUUID()}-${filename}`;
-      const gcsStream = bucket
-        .file(destination)
-        .createWriteStream({ contentType: mimeType });
+      const gcsFile = bucket.file(destination);
+      const gcsStream = gcsFile.createWriteStream({ contentType: mimeType });
+
+      const branchA = new PassThrough();
+      const branchB = new PassThrough();
+      fileStream.pipe(branchA);
+      fileStream.pipe(branchB);
+
+      const csvStream = branchB.pipe(parse({ headers: true }));
+      let totalRows = 0;
+      let successfulRows = 0;
+      let failedRows = 0;
+      const rowErrors: { row: number; reason: string }[] = [];
+      const shardBuffers = new ShardBufferManager();
+
+      csvStream.on("data", (row) => {
+        totalRows++;
+        const result = orderRowSchema.safeParse(row);
+        if (!result.success) {
+          failedRows++;
+          const reason = result.error.issues
+            .map((issue) => `${issue.path.join(".")}: ${issue.message}`)
+            .join("; ");
+          rowErrors.push({ row: totalRows, reason });
+          logger.warn({ row: totalRows, reason }, "Skipping invalid order row");
+          return;
+        }
+        successfulRows++;
+        const targetShardIdx = shardBuffers.add(result.data);
+
+        if (shardBuffers.isFull(targetShardIdx)) {
+          csvStream.pause();
+          shardBuffers
+            .flush(targetShardIdx)
+            .then(() => csvStream.resume())
+            .catch((error: unknown) => {
+              logger.error(error, "Failed to bulk insert order batch");
+              gcsStream.destroy();
+              csvStream.destroy();
+              settle(() =>
+                reject(new AppError(502, "Failed to write orders to database")),
+              );
+            });
+        }
+      });
+
+      let gcsDone = false;
+      let csvDone = false;
+      const maybeFinish = () => {
+        if (!gcsDone || !csvDone) return;
+        settle(() => {
+          const url = gcsFile.publicUrl();
+          logger.info(
+            { destination, url, totalRows, successfulRows, failedRows },
+            "Order file uploaded",
+          );
+          res.status(200).json({
+            file: url,
+            totalRows,
+            successfulRows,
+            failedRows,
+            rowErrors,
+          });
+          resolve();
+        });
+      };
 
       fileStream.on("limit", () => {
         gcsStream.destroy();
+        csvStream.destroy();
         settle(() =>
           reject(
             new AppError(
@@ -62,18 +124,38 @@ export const uploadOrders = asyncHandler((req, res) => {
 
       gcsStream.on("error", (error) => {
         logger.error(error, "Failed to upload file to GCS");
+        csvStream.destroy();
         settle(() => reject(new AppError(502, "Failed to store file")));
       });
 
-      gcsStream.on("finish", () => {
-        settle(() => {
-          logger.info({ destination }, "Order file uploaded");
-          res.status(202).json({ file: destination });
-          resolve();
-        });
+      csvStream.on("error", (error) => {
+        logger.error(error, "Failed to parse CSV file");
+        gcsStream.destroy();
+        settle(() => reject(new AppError(400, "Malformed CSV file")));
       });
 
-      fileStream.pipe(gcsStream);
+      gcsStream.on("finish", () => {
+        gcsDone = true;
+        maybeFinish();
+      });
+
+      csvStream.on("end", () => {
+        shardBuffers
+          .flushAll()
+          .then(() => {
+            csvDone = true;
+            maybeFinish();
+          })
+          .catch((error: unknown) => {
+            logger.error(error, "Failed to flush final order batch");
+            gcsStream.destroy();
+            settle(() =>
+              reject(new AppError(502, "Failed to write orders to database")),
+            );
+          });
+      });
+
+      branchA.pipe(gcsStream);
     });
 
     busboy.on("error", () => {
