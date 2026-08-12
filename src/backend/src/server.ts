@@ -2,6 +2,7 @@ import express from "express";
 import cors from "cors";
 import "dotenv/config";
 import { logger } from "./logger.js";
+import { metrics } from "./metrics.js";
 import { connectDB } from "./db/pool.js";
 import { ordersRouter } from "./routes/orders.routes.js";
 import { notFoundHandler, errorHandler } from "./middleware/errorHandler.js";
@@ -15,6 +16,10 @@ app.use(express.json());
 
 app.get("/health", (_req, res) => {
   res.json({ status: "ok" });
+});
+
+app.get("/metrics", (_req, res) => {
+  res.json(metrics.snapshot());
 });
 
 app.use(ordersRouter);
