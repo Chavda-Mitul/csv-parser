@@ -57,6 +57,21 @@ export const uploadOrders = asyncHandler((req, res) => {
       const rowErrors: { row: number; reason: string }[] = [];
       const shardBuffers = new ShardBufferManager();
 
+      let checkedMagic = false;
+      fileStream.on("data", (chunk: Buffer) => {
+        if (checkedMagic) return;
+        checkedMagic = true;
+        if (chunk.subarray(0, 512).includes(0)) {
+          gcsStream.destroy();
+          csvStream.destroy();
+          settle(() =>
+            reject(
+              new AppError(400, "File does not appear to be a valid CSV"),
+            ),
+          );
+        }
+      });
+
       csvStream.on("data", (row) => {
         totalRows++;
         const result = orderRowSchema.safeParse(row);

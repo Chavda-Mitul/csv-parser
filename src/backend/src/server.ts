@@ -1,4 +1,5 @@
 import express from "express";
+import cors from "cors";
 import "dotenv/config";
 import { logger } from "./logger.js";
 import { connectDB } from "./db/pool.js";
@@ -9,6 +10,7 @@ import { registerShutdownHandlers, setServer } from "./shutdown.js";
 const app = express();
 const port = Number(process.env.PORT ?? 3000);
 
+app.use(cors());
 app.use(express.json());
 
 app.get("/health", (_req, res) => {

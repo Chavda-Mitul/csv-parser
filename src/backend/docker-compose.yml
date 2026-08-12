@@ -9,10 +9,7 @@ services:
       - "3000:3000"
     env_file:
       - .env
-    environment:
-      - SHARD_1_URL=postgresql://postgres:postgrespassword@postgres_shard_1:5432/shard_1
-      - SHARD_2_URL=postgresql://postgres:postgrespassword@postgres_shard_2:5432/shard_2
-      - SHARD_3_URL=postgresql://postgres:postgrespassword@postgres_shard_3:5432/shard_3
+      - .env.docker
     volumes:
       - ~/.config/gcloud:/root/.config/gcloud:ro # Mounts ADC credentials into the container
     depends_on:

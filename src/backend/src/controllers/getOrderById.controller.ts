@@ -1,0 +1,32 @@
+import { z } from "zod";
+import { AppError } from "../errors/AppError.js";
+import { asyncHandler } from "../middleware/asyncHandler.js";
+import { shardPools } from "../db/pool.js";
+
+const paramsOrderIdSchema = z.object({
+  orderId: z.string().trim().min(1),
+});
+
+export const getOrderById = asyncHandler(async (req, res) => {
+  const result = paramsOrderIdSchema.safeParse(req.params);
+  if (!result.success) {
+    throw new AppError(
+      400,
+      result.error.issues[0]?.message ?? "orderId is required",
+    );
+  }
+  const { orderId } = result.data;
+
+  const results = await Promise.all(
+    shardPools.map((pool) =>
+      pool.query("SELECT * FROM orders WHERE order_id = $1", [orderId]),
+    ),
+  );
+  const order = results.flatMap((r) => r.rows)[0];
+
+  if (!order) {
+    throw new AppError(404, "Order not found");
+  }
+
+  res.status(200).json(order);
+});
