@@ -16,6 +16,7 @@ services:
       - postgres_shard_1
       - postgres_shard_2
       - postgres_shard_3
+      - postgres_jobs
 
   # Shard 1 Instance
   postgres_shard_1:
@@ -56,7 +57,22 @@ services:
     volumes:
       - postgres_shard_3_data:/var/lib/postgresql/data
 
+  # pg-boss job queue database — separate from the order shards so queue health/load
+  # isn't coupled to shard load.
+  postgres_jobs:
+    image: postgres:15-alpine
+    container_name: postgres_jobs
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgrespassword
+      POSTGRES_DB: jobs
+    ports:
+      - "5435:5432"
+    volumes:
+      - postgres_jobs_data:/var/lib/postgresql/data
+
 volumes:
   postgres_shard_1_data:
   postgres_shard_2_data:
   postgres_shard_3_data:
+  postgres_jobs_data:

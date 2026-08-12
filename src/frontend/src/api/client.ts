@@ -1,4 +1,4 @@
-import type { ApiErrorBody, OrderRow, UploadResult } from "./types";
+import type { ApiErrorBody, OrderRow, UploadJobEnqueued, UploadJobStatus } from "./types";
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "";
 
@@ -22,7 +22,7 @@ export async function getHealth(): Promise<boolean> {
 export function uploadOrders(
   file: File,
   onProgress: (percent: number) => void,
-): Promise<UploadResult> {
+): Promise<UploadJobEnqueued> {
   return new Promise((resolve, reject) => {
     const form = new FormData();
     form.append("file", file);
@@ -42,7 +42,7 @@ export function uploadOrders(
         body = {};
       }
       if (xhr.status >= 200 && xhr.status < 300) {
-        resolve(body as UploadResult);
+        resolve(body as UploadJobEnqueued);
       } else {
         reject(new ApiError(xhr.status, (body as ApiErrorBody).error ?? "Upload failed"));
       }
@@ -68,4 +68,8 @@ export function getOrdersByCustomer(customerId: string): Promise<OrderRow[]> {
 
 export function getOrderById(orderId: string): Promise<OrderRow> {
   return getJson<OrderRow>(`${API_BASE_URL}/orders/${encodeURIComponent(orderId)}`);
+}
+
+export function getUploadJobStatus(jobId: string): Promise<UploadJobStatus> {
+  return getJson<UploadJobStatus>(`${API_BASE_URL}/upload-orders/${encodeURIComponent(jobId)}`);
 }

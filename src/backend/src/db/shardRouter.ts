@@ -20,3 +20,7 @@ export function getShardIndexForCustomer(customerId: string): number {
 export function getShardPoolForCustomer(customerId: string): Pool {
   return getShardPool(getShardIndexForCustomer(customerId));
 }
+
+export function getAllShardPools(): Pool[] {
+  return shardPools;
+}

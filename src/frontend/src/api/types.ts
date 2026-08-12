@@ -26,3 +26,12 @@ export interface OrderRow {
 export interface ApiErrorBody {
   error?: string;
 }
+
+export interface UploadJobEnqueued {
+  jobId: string;
+}
+
+export type UploadJobStatus =
+  | { jobId: string; status: "processing" }
+  | ({ jobId: string; status: "done" } & UploadResult)
+  | { jobId: string; status: "error"; error: string };
