@@ -8,6 +8,7 @@
     "build": "tsc",
     "start": "node dist/server.js",
     "migrate": "tsx src/migrate.ts",
+    "query": "tsx src/queryShards.ts",
     "format": "prettier --write src"
   },
   "keywords": [],
