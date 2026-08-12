@@ -11,7 +11,7 @@ services:
       - .env
       - .env.docker
     volumes:
-      - ~/.config/gcloud:/root/.config/gcloud:ro # Mounts ADC credentials into the container
+      - ${APPDATA}/gcloud:/root/.config/gcloud:ro # Mounts ADC credentials into the container (Windows: %APPDATA%\gcloud)
     depends_on:
       - postgres_shard_1
       - postgres_shard_2
