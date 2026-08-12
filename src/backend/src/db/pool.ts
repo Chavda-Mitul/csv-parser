@@ -29,3 +29,7 @@ export function getShardIndexForCustomer(customerId: string): number {
 export function getShardPoolForCustomer(customerId: string): Pool {
   return getShardPool(getShardIndexForCustomer(customerId));
 }
+
+export async function connectDB(): Promise<void> {
+  await Promise.all(shardPools.map((pool) => pool.query("SELECT 1")));
+}

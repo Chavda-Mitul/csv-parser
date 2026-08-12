@@ -31,7 +31,7 @@ async function migrateShard(pool: any, shardIndex: number) {
       "SELECT name FROM schema_migrations"
     );
 
-    const applied = new Set(rows.map((row) => row.name));
+    const applied = new Set(rows.map((row: { name: string }) => row.name));
 
     // Run migrations in order
     for (const migration of migrations) {
