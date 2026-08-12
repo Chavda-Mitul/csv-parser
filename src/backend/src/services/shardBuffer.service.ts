@@ -40,11 +40,11 @@ export class ShardBufferManager {
     const batch = buffer.splice(0, buffer.length);
     const values: unknown[] = [];
     const placeholders = batch.map((row, i) => {
-      const base = i * 4;
-      values.push(row.order_id, row.customer_id, row.order_date, row.order_amount);
-      return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4})`;
+      const base = i * 5;
+      values.push(row.order_id, row.customer_id, row.order_date, row.order_amount, row.status);
+      return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5})`;
     });
-    const sql = `INSERT INTO orders (order_id, customer_id, order_date, order_amount) VALUES ${placeholders.join(", ")} ON CONFLICT (order_id) DO NOTHING`;
+    const sql = `INSERT INTO orders (order_id, customer_id, order_date, order_amount, status) VALUES ${placeholders.join(", ")} ON CONFLICT (order_id) DO NOTHING`;
     await getShardPool(shardIdx).query(sql, values);
   }
 

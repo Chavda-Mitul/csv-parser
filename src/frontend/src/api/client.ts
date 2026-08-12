@@ -1,5 +1,7 @@
 import type { ApiErrorBody, OrderRow, UploadResult } from "./types";
 
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "";
+
 export class ApiError extends Error {
   status: number;
   constructor(status: number, message: string) {
@@ -10,7 +12,7 @@ export class ApiError extends Error {
 
 export async function getHealth(): Promise<boolean> {
   try {
-    const res = await fetch("/health");
+    const res = await fetch(`${API_BASE_URL}/health`);
     return res.ok;
   } catch {
     return false;
@@ -26,7 +28,7 @@ export function uploadOrders(
     form.append("file", file);
 
     const xhr = new XMLHttpRequest();
-    xhr.open("POST", "/upload-orders");
+    xhr.open("POST", `${API_BASE_URL}/upload-orders`);
 
     xhr.upload.onprogress = (e) => {
       if (e.lengthComputable) onProgress(Math.round((e.loaded / e.total) * 100));
@@ -61,9 +63,9 @@ async function getJson<T>(url: string): Promise<T> {
 }
 
 export function getOrdersByCustomer(customerId: string): Promise<OrderRow[]> {
-  return getJson<OrderRow[]>(`/orders?customerId=${encodeURIComponent(customerId)}`);
+  return getJson<OrderRow[]>(`${API_BASE_URL}/orders?customerId=${encodeURIComponent(customerId)}`);
 }
 
 export function getOrderById(orderId: string): Promise<OrderRow> {
-  return getJson<OrderRow>(`/orders/${encodeURIComponent(orderId)}`);
+  return getJson<OrderRow>(`${API_BASE_URL}/orders/${encodeURIComponent(orderId)}`);
 }

@@ -10,5 +10,6 @@ export const orderRowSchema = z.object({
   customer_id: z.string().trim().min(1),
   order_amount: z.coerce.number().positive(),
   order_date: z.coerce.date(),
+  status: z.string().trim().min(1).default("PENDING"),
 });
 export type OrderRow = z.infer<typeof orderRowSchema>;

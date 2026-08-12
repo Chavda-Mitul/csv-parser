@@ -10,7 +10,7 @@ import { registerShutdownHandlers, setServer } from "./shutdown.js";
 const app = express();
 const port = Number(process.env.PORT ?? 3000);
 
-app.use(cors());
+app.use(cors({ origin: process.env.FRONTEND_ORIGIN }));
 app.use(express.json());
 
 app.get("/health", (_req, res) => {
