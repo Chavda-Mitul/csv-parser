@@ -116,42 +116,26 @@ to one shard — see scatter-gather below.
 
 ## System design trade-offs
 
-**Bounded streaming backpressure.** The upload handler
-(`src/backend/src/controllers/uploadOrders.controller.ts`) tees the incoming multipart file stream
-into two branches — one piped straight to a GCS write stream, one through `fast-csv`'s streaming
-parser — so the process never buffers the whole file in memory. Valid rows are queued into
-per-shard batches (`ShardBufferManager`, `src/backend/src/services/shardBuffer.service.ts`) capped
-at `BATCH_SIZE` (500). A batch is flushed asynchronously as soon as it fills, but if a *second*
-full batch piles up behind a shard whose flush is still in flight, the CSV stream itself is
-`pause()`d and only `resume()`d once that shard's flush settles. This keeps per-shard memory
-bounded — a batch and a half in flight, at most — without stalling on every single flush.
+- **Bounded streaming backpressure.** The upload stream is teed into a GCS write branch and a
+  `fast-csv` parse branch, so the process never buffers the whole file in memory. Valid rows batch
+  per-shard (`ShardBufferManager`, cap `BATCH_SIZE=500`); if a second full batch piles up behind a
+  shard whose flush is still in flight, the CSV stream is paused until that flush settles.
+- **Cross-shard parallel flushing.** Each shard flushes independently (one in-flight flush per
+  shard), so a slow shard never blocks the others. Final flush latency is bounded by the slowest
+  shard, not the sum of all shards.
+- **Intentional intra-shard serialization.** A shard never runs two flushes concurrently — a second
+  batch just waits for the in-flight one. One connection pool per shard is the real bottleneck
+  anyway, so parallelizing within a shard would only add ordering complexity for no throughput gain.
+- **Scatter-gather for non-shard-key lookups.** `GET /orders/:orderId` can't know which shard holds
+  an order (`order_id` isn't the hash key), so it queries every shard in parallel and returns the
+  one match. Cheap at N=3; would need a shard-lookup index at much larger N.
+- **Async ingestion via job queue.** `POST /upload-orders` only stages the file (validates, streams
+  to disk, backs up to GCS) and returns `202 { jobId }` immediately — it doesn't wait for CSV
+  parsing or DB writes. The actual ingestion runs in a background pg-boss job; poll
+  `GET /upload-orders/:jobId` for `{ status, result }` (`totalRows`/`successfulRows`/`failedRows`/
+  `rowErrors`) once it completes.
 
-**Cross-shard parallel flushing.** Each shard's buffer flushes independently: `ShardBufferManager`
-tracks at most one in-flight flush *per shard*, so a slow shard 2 never blocks shards 1 or 3 from
-flushing their own full batches. On end-of-stream, `flushAll()` waits for every shard's in-flight
-flush and then flushes any remaining partial batches, all via `Promise.all` — final flush latency
-is bounded by the slowest shard, not the sum of all shards.
-
-**Intentional intra-shard serialization.** Within a single shard, flushes are *not* parallelized —
-a second batch that fills up while a flush is already running just waits for the in-flight promise
-(`waitFor`) rather than firing a concurrent query. This is deliberate: parallel writes to the same
-shard would let their batches complete out of order for no throughput benefit (one Postgres
-connection pool, one bottleneck), while adding retry/ordering complexity for row batches from a
-single CSV that don't need it. Backpressure on a shard converts "queue more work behind a slow
-shard" into "briefly pause the source," which is simpler and keeps memory bounded.
-
-**Scatter-gather for non-shard-key lookups.** `GET /orders/:orderId`
-(`src/backend/src/controllers/getOrderById.controller.ts`) can't know which shard holds a given
-order without checking, since `order_id` isn't the hash key. It queries every shard pool in
-parallel (`Promise.all`) and returns the one match (`order_id` is each shard's primary key) or 404
-if none has it. Cheap at N=3; would need a shard-lookup index or a different partitioning strategy
-to stay cheap at much larger N.
-
-**Blocking ingestion response.** `POST /upload-orders` waits for the GCS write and all DB flushes
-to complete before responding, returning
-`{ file, totalRows, successfulRows, failedRows, rowErrors }`. This was a deliberate choice to give
-the caller real ingestion metrics — including per-row validation failures — in one round-trip,
-rather than a fire-and-forget `202` with no visibility into row-level outcomes.
+See `CLAUDE.md` for the full pipeline breakdown (file paths, module names, error handling).
 
 ## Project layout
 
