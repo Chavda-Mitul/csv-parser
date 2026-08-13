@@ -9,7 +9,7 @@ const shardUrls = Object.entries(process.env)
 if (shardUrls.length === 0) throw new Error("No SHARD_*_URL env vars found");
 
 export const shardPools: Pool[] = shardUrls.map(
-  (connectionString) => new Pool({ connectionString }),
+  (connectionString) => new Pool({ connectionString, connectionTimeoutMillis: 5000 }),
 );
 
 export async function connectDB(): Promise<void> {
