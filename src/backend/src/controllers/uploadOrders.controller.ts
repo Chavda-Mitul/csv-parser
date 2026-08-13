@@ -1,10 +1,7 @@
 import Busboy from "busboy";
 import { randomUUID } from "crypto";
-import { createWriteStream } from "fs";
-import { unlink } from "fs/promises";
-import { tmpdir } from "os";
-import { join } from "path";
 import { boss } from "../db/pgBoss.js";
+import { bucket } from "../gcloud/bucket.js";
 import { logger } from "../logger.js";
 import { AppError } from "../errors/AppError.js";
 import { asyncHandler } from "../middleware/asyncHandler.js";
@@ -15,8 +12,11 @@ const MAX_FILE_BYTES = 50 * 1024 * 1024; // 50MB
 
 // Receives and stages the upload only — the actual GCS backup + CSV parse + shard
 // writes happen in the pg-boss job (src/jobs/uploadOrders.job.ts) so this request
-// returns as soon as the file is safely on disk, instead of blocking for the full
-// ingestion duration.
+// returns as soon as the file is safely staged, instead of blocking for the full
+// ingestion duration. Staged to GCS rather than local disk: the pg-boss worker that
+// picks up the job can run on a different instance than the one that handled this
+// request (Cloud Run scales to multiple instances, each running its own worker), so
+// a local temp file wouldn't be visible to whichever instance processes the job.
 export const uploadOrders = asyncHandler((req, res) => {
   return new Promise<void>((resolve, reject) => {
     const busboy = Busboy({
@@ -26,7 +26,7 @@ export const uploadOrders = asyncHandler((req, res) => {
 
     let handledFile = false;
     let settled = false;
-    let stagingTempFilePath: string | undefined;
+    let stagingFile: ReturnType<typeof bucket.file> | undefined;
 
     const settle = (fn: () => void) => {
       if (settled) return;
@@ -48,16 +48,14 @@ export const uploadOrders = asyncHandler((req, res) => {
       }
       const { filename, mimeType } = parsed.data;
 
-      const tempFilePath = join(
-        tmpdir(),
-        `upload-${randomUUID()}-${filename}`,
-      );
-      stagingTempFilePath = tempFilePath;
-      const tempStream = createWriteStream(tempFilePath);
+      const stagingPath = `staging/${randomUUID()}-${filename}`;
+      const gcsFile = bucket.file(stagingPath);
+      stagingFile = gcsFile;
+      const stagingStream = gcsFile.createWriteStream({ contentType: mimeType });
 
       fileStream.on("limit", () => {
-        tempStream.destroy();
-        void unlink(tempFilePath).catch(() => {});
+        stagingStream.destroy();
+        void gcsFile.delete().catch(() => {});
         settle(() =>
           reject(
             new AppError(
@@ -68,40 +66,40 @@ export const uploadOrders = asyncHandler((req, res) => {
         );
       });
 
-      tempStream.on("error", (error) => {
+      stagingStream.on("error", (error) => {
         logger.error(error, "Failed to stage uploaded file");
-        void unlink(tempFilePath).catch(() => {});
+        void gcsFile.delete().catch(() => {});
         settle(() =>
           reject(new AppError(500, "Failed to stage uploaded file")),
         );
       });
 
-      tempStream.on("finish", () => {
+      stagingStream.on("finish", () => {
         settle(() => {
           boss
-            .send(UPLOAD_ORDERS_QUEUE, { tempFilePath, filename, mimeType })
+            .send(UPLOAD_ORDERS_QUEUE, { stagingPath, filename, mimeType })
             .then((jobId) => {
               if (!jobId) {
                 throw new Error("boss.send returned no jobId");
               }
-              stagingTempFilePath = undefined;
+              stagingFile = undefined;
               res.status(202).json({ jobId });
               resolve();
             })
             .catch((error: unknown) => {
               logger.error(error, "Failed to enqueue upload job");
-              void unlink(tempFilePath).catch(() => {});
+              void gcsFile.delete().catch(() => {});
               reject(new AppError(500, "Failed to queue upload"));
             });
         });
       });
 
-      fileStream.pipe(tempStream);
+      fileStream.pipe(stagingStream);
     });
 
     busboy.on("error", () => {
-      if (stagingTempFilePath) {
-        void unlink(stagingTempFilePath).catch(() => {});
+      if (stagingFile) {
+        void stagingFile.delete().catch(() => {});
       }
       settle(() => reject(new AppError(400, "Invalid multipart upload")));
     });
