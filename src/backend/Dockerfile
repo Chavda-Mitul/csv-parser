@@ -19,6 +19,8 @@ RUN npm install --omit=dev
 
 COPY --from=build /usr/src/app/dist ./dist
 
+USER node
+
 EXPOSE 3000
 
 CMD ["npm", "start"]

@@ -1,0 +1,84 @@
+name: Deploy
+
+on:
+  push:
+    branches: [master]
+
+env:
+  PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+  REGION: asia-south1
+  SERVICE: csv-backend
+  RUNTIME_SA: csv-backend-run@${{ vars.GCP_PROJECT_ID }}.iam.gserviceaccount.com
+  CLOUDSQL_INSTANCE: ${{ vars.GCP_PROJECT_ID }}:asia-south1:csv-processing-shards
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy-backend:
+    runs-on: ubuntu-latest
+    outputs:
+      cloud_run_url: ${{ steps.deploy.outputs.url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.DEPLOY_SA }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - run: gcloud auth configure-docker asia-south1-docker.pkg.dev --quiet
+
+      - name: Build and push image
+        run: |
+          IMAGE="asia-south1-docker.pkg.dev/${{ env.PROJECT_ID }}/backend/csv-backend:${{ github.sha }}"
+          docker build -f src/backend/Dockerfile -t "$IMAGE" src/backend
+          docker push "$IMAGE"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+
+      - id: deploy
+        name: Deploy to Cloud Run
+        run: |
+          gcloud run deploy ${{ env.SERVICE }} \
+            --project=${{ env.PROJECT_ID }} \
+            --region=${{ env.REGION }} \
+            --image="$IMAGE" \
+            --service-account=${{ env.RUNTIME_SA }} \
+            --add-cloudsql-instances=${{ env.CLOUDSQL_INSTANCE }} \
+            --set-secrets=SHARD_1_URL=SHARD_1_URL:latest,SHARD_2_URL=SHARD_2_URL:latest,SHARD_3_URL=SHARD_3_URL:latest,PGBOSS_URL=PGBOSS_URL:latest,GCS_BUCKET_NAME=GCS_BUCKET_NAME:latest \
+            --set-env-vars=GCP_PROJECT_ID=${{ env.PROJECT_ID }},FRONTEND_ORIGIN=${{ vars.FRONTEND_ORIGIN }} \
+            --min-instances=1 --max-instances=3 \
+            --concurrency=20 --memory=512Mi --cpu=1 --timeout=300 \
+            --allow-unauthenticated --quiet
+          echo "url=$(gcloud run services describe ${{ env.SERVICE }} --region=${{ env.REGION }} --format='value(status.url)')" >> "$GITHUB_OUTPUT"
+
+  deploy-frontend:
+    runs-on: ubuntu-latest
+    needs: deploy-backend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.DEPLOY_SA }}
+
+      - name: Install and build frontend
+        working-directory: src/frontend
+        env:
+          VITE_API_BASE_URL: ${{ needs.deploy-backend.outputs.cloud_run_url }}
+          VITE_SHARD_COUNT: "3"
+        run: |
+          npm ci
+          npm run build
+
+      - name: Deploy to Firebase Hosting
+        run: npx firebase-tools deploy --only hosting --project ${{ env.PROJECT_ID }} --non-interactive

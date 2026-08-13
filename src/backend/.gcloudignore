@@ -1,0 +1,7 @@
+.git
+node_modules
+dist
+.env
+.env.*
+.gcp-shard-password.txt
+npm-debug.log
