@@ -80,7 +80,7 @@ scatter-gathers — queries every shard pool in parallel via `Promise.all` and t
 ### Ingestion pipeline (`POST /upload-orders` + async job)
 
 `POST /upload-orders` only *stages* the upload: Busboy parses the multipart request, validates the
-file info (`fileInfoSchema`, zod) and 50MB size limit, and streams the raw bytes to a temp file on
+file info (`fileInfoSchema`, zod) and 500MB size limit, and streams the raw bytes to a temp file on
 disk. As soon as that write finishes it enqueues a pg-boss job (`upload-orders` queue,
 `src/jobs/uploadOrders.job.ts`) with the temp file path, and responds `202 { jobId }` — it does not
 wait for GCS backup, CSV parsing, or any DB writes.
@@ -139,3 +139,16 @@ Vite + React 19 + MUI, talking to the backend via `src/frontend/src/api/client.t
 `failedRows`/`rowErrors`), `QueryWorkspace` for the customer/order-id lookup endpoints.
 `src/frontend/src/lib/crc32.ts` mirrors the backend's shard-hash client-side (e.g. for showing
 which shard a customer routes to).
+
+### Deployment
+
+`.github/workflows/deploy.yml` runs on every push to `master`: builds the backend Docker image
+(`src/backend/Dockerfile`) and deploys it to Cloud Run (`asia-south1`, Cloud SQL via the
+`--add-cloudsql-instances` Unix socket connector, shard/PGBoss URLs injected from Secret Manager),
+then builds the frontend with `VITE_API_BASE_URL` pointed at the freshly-deployed Cloud Run URL
+and deploys it to Firebase Hosting. Auth is via Workload Identity Federation, no long-lived GCP
+keys in CI.
+
+See `ARCHITECTURE.md` for the full design writeup (sequence/component diagrams, schema, API
+reference, and a decisions table with alternatives considered) — this file covers the same ground
+but at implementation-file granularity.

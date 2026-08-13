@@ -3,7 +3,7 @@ import { Box, Stack, Typography } from "@mui/material";
 import UploadFileIcon from "@mui/icons-material/UploadFile";
 import { useSnackbar } from "notistack";
 
-const MAX_BYTES = 50 * 1024 * 1024;
+const MAX_BYTES = 500 * 1024 * 1024;
 
 interface DropzoneProps {
   disabled?: boolean;
@@ -24,7 +24,7 @@ export function Dropzone({ disabled, onFile }: DropzoneProps) {
       return false;
     }
     if (file.size > MAX_BYTES) {
-      enqueueSnackbar("File size exceeds 50MB limit", { variant: "error" });
+      enqueueSnackbar("File size exceeds 500MB limit", { variant: "error" });
       return false;
     }
     return true;
@@ -76,7 +76,7 @@ export function Dropzone({ disabled, onFile }: DropzoneProps) {
         <UploadFileIcon sx={{ fontSize: 36, color: "primary.main" }} />
         <Typography variant="body1">Drag & drop an order CSV, or click to browse</Typography>
         <Typography variant="mono" sx={{ fontSize: 12, color: "text.secondary" }}>
-          .csv only · max 50MB
+          .csv only · max 500MB
         </Typography>
       </Stack>
     </Box>

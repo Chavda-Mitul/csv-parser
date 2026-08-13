@@ -38,7 +38,7 @@ sequenceDiagram
     participant Shards as Postgres Shards (1..N)
 
     Client->>API: POST /upload-orders (multipart CSV)
-    API->>API: Busboy parse + fileInfoSchema validation + 50MB limit
+    API->>API: Busboy parse + fileInfoSchema validation + 500MB limit
     API->>Disk: stream raw bytes to temp file
     API->>Queue: enqueue "upload-orders" job {tempFilePath}
     API-->>Client: 202 { jobId }
@@ -364,7 +364,7 @@ project.
 
 ### 7.2 Upload pipeline security
 
-- 50MB hard cap on upload size, enforced by Busboy before any parsing begins.
+- 500MB hard cap on upload size, enforced by Busboy before any parsing begins.
 - MIME type + filename extension checked before the file is persisted to disk.
 - Magic-byte (null-byte) sniff rejects binary payloads disguised as `.csv` before they're
   fully written or parsed.
@@ -381,12 +381,12 @@ project.
 
 Multipart file upload. Stages the file and enqueues ingestion; does not wait for it.
 
-- **Request:** `multipart/form-data`, one file field, `.csv` filename + CSV-compatible MIME type, ≤50MB.
+- **Request:** `multipart/form-data`, one file field, `.csv` filename + CSV-compatible MIME type, ≤500MB.
 - **Response `202`:**
   ```json
   { "jobId": "9f2c1e0a-..." }
   ```
-- **Errors:** `400` (bad content-type / missing or invalid file / malformed multipart), `413` (>50MB), `500` (staging/enqueue failure).
+- **Errors:** `400` (bad content-type / missing or invalid file / malformed multipart), `413` (>500MB), `500` (staging/enqueue failure).
 
 ### `GET /upload-orders/:jobId`
 

@@ -8,7 +8,7 @@ import { asyncHandler } from "../middleware/asyncHandler.js";
 import { fileInfoSchema } from "../validation/orderRow.js";
 import { UPLOAD_ORDERS_QUEUE } from "../jobs/uploadOrders.job.js";
 
-const MAX_FILE_BYTES = 50 * 1024 * 1024; // 50MB
+const MAX_FILE_BYTES = 500 * 1024 * 1024; // 500MB
 
 // Receives and stages the upload only — the actual GCS backup + CSV parse + shard
 // writes happen in the pg-boss job (src/jobs/uploadOrders.job.ts) so this request
