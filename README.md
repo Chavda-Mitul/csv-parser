@@ -10,6 +10,15 @@ Two independent projects, each with its own `package.json`:
 - `src/backend` — Node.js (Express 5) API, streaming ingestion pipeline, sharded Postgres access.
 - `src/frontend` — Vite + React 19 + MUI UI for uploading CSVs and querying orders.
 
+## Production deployment
+
+- **Frontend:** https://project-e0877da6-3d8f-478e-9d0.web.app (Firebase Hosting)
+- **Backend API:** https://csv-backend-872514907180.asia-south1.run.app (Cloud Run)
+
+Backend runs on Cloud Run, connected to Cloud SQL (PostgreSQL) over the private Unix-socket
+connector. Frontend is a static build on Firebase Hosting. Both deploy automatically via GitHub
+Actions on push to `master` — see `.github/workflows/deploy.yml`.
+
 ## Setup
 
 ### 1. Backend environment
