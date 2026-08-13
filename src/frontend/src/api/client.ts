@@ -20,38 +20,64 @@ export async function getHealth(): Promise<boolean> {
   }
 }
 
-export function uploadOrders(
+async function postJson<T>(url: string, body: unknown): Promise<T> {
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-api-key": API_KEY },
+    body: JSON.stringify(body),
+  });
+  const responseBody = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new ApiError(res.status, (responseBody as ApiErrorBody).error ?? "Request failed");
+  }
+  return responseBody as T;
+}
+
+function putToSignedUrl(
+  uploadUrl: string,
   file: File,
   onProgress: (percent: number) => void,
-): Promise<UploadJobEnqueued> {
+): Promise<void> {
   return new Promise((resolve, reject) => {
-    const form = new FormData();
-    form.append("file", file);
-
     const xhr = new XMLHttpRequest();
-    xhr.open("POST", `${API_BASE_URL}/upload-orders`);
-    xhr.setRequestHeader("x-api-key", API_KEY);
+    xhr.open("PUT", uploadUrl);
+    xhr.setRequestHeader("Content-Type", file.type);
 
     xhr.upload.onprogress = (e) => {
       if (e.lengthComputable) onProgress(Math.round((e.loaded / e.total) * 100));
     };
 
     xhr.onload = () => {
-      let body: unknown;
-      try {
-        body = JSON.parse(xhr.responseText);
-      } catch {
-        body = {};
-      }
       if (xhr.status >= 200 && xhr.status < 300) {
-        resolve(body as UploadJobEnqueued);
+        resolve();
       } else {
-        reject(new ApiError(xhr.status, (body as ApiErrorBody).error ?? "Upload failed"));
+        reject(new ApiError(xhr.status, "Upload to storage failed"));
       }
     };
     xhr.onerror = () => reject(new ApiError(0, "Network error during upload"));
 
-    xhr.send(form);
+    xhr.send(file);
+  });
+}
+
+// Cloud Run caps request bodies at 32MiB, so the file never passes through our backend:
+// init mints a signed GCS URL, the browser PUTs the file straight to storage, then complete
+// tells the backend to enqueue ingestion.
+export async function uploadOrders(
+  file: File,
+  onProgress: (percent: number) => void,
+): Promise<UploadJobEnqueued> {
+  const { uploadUrl, stagingPath } = await postJson<{ uploadUrl: string; stagingPath: string }>(
+    `${API_BASE_URL}/upload-orders/init`,
+    { filename: file.name, mimeType: file.type, size: file.size },
+  );
+
+  await putToSignedUrl(uploadUrl, file, onProgress);
+
+  return postJson<UploadJobEnqueued>(`${API_BASE_URL}/upload-orders/complete`, {
+    stagingPath,
+    filename: file.name,
+    mimeType: file.type,
   });
 }
 

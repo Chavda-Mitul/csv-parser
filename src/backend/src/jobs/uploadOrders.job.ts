@@ -1,6 +1,8 @@
 import { boss } from "../db/pgBoss.js";
 import { bucket } from "../gcloud/bucket.js";
 import { logger } from "../logger.js";
+import { AppError } from "../errors/AppError.js";
+import { MAX_FILE_BYTES } from "../validation/orderRow.js";
 import { ingestOrdersFile } from "../services/ordersIngest.service.js";
 
 export const UPLOAD_ORDERS_QUEUE = "upload-orders";
@@ -26,6 +28,14 @@ export async function registerUploadOrdersWorker() {
     const { stagingPath, filename, mimeType } = job.data;
     const stagingFile = bucket.file(stagingPath);
     try {
+      // The signed-URL upload isn't stream-limited like the old Busboy path was, so this is
+      // the real enforcement point for MAX_FILE_BYTES (the `size` field checked at init time
+      // is only client-declared, not trustworthy).
+      const [{ size }] = await stagingFile.getMetadata();
+      if (Number(size) > MAX_FILE_BYTES) {
+        throw new AppError(413, `File exceeds maximum size of ${MAX_FILE_BYTES} bytes`);
+      }
+
       return await ingestOrdersFile(stagingFile.createReadStream(), {
         filename,
         mimeType,
