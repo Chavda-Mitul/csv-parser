@@ -71,11 +71,19 @@ jobs:
           workload_identity_provider: ${{ vars.WIF_PROVIDER }}
           service_account: ${{ vars.DEPLOY_SA }}
 
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Fetch API key
+        run: |
+          echo "::add-mask::$(gcloud secrets versions access latest --secret=API_KEY --project=${{ env.PROJECT_ID }})"
+          echo "VITE_API_KEY=$(gcloud secrets versions access latest --secret=API_KEY --project=${{ env.PROJECT_ID }})" >> "$GITHUB_ENV"
+
       - name: Install and build frontend
         working-directory: src/frontend
         env:
           VITE_API_BASE_URL: ${{ needs.deploy-backend.outputs.cloud_run_url }}
           VITE_SHARD_COUNT: "3"
+          VITE_API_KEY: ${{ env.VITE_API_KEY }}
         run: |
           npm ci
           npm run build
