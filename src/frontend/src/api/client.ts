@@ -1,6 +1,7 @@
 import type { ApiErrorBody, OrderRow, UploadJobEnqueued, UploadJobStatus } from "./types";
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "";
+const API_KEY = import.meta.env.VITE_API_KEY ?? "";
 
 export class ApiError extends Error {
   status: number;
@@ -29,6 +30,7 @@ export function uploadOrders(
 
     const xhr = new XMLHttpRequest();
     xhr.open("POST", `${API_BASE_URL}/upload-orders`);
+    xhr.setRequestHeader("x-api-key", API_KEY);
 
     xhr.upload.onprogress = (e) => {
       if (e.lengthComputable) onProgress(Math.round((e.loaded / e.total) * 100));
@@ -54,7 +56,7 @@ export function uploadOrders(
 }
 
 async function getJson<T>(url: string): Promise<T> {
-  const res = await fetch(url);
+  const res = await fetch(url, { headers: { "x-api-key": API_KEY } });
   const body = await res.json().catch(() => ({}));
   if (!res.ok) {
     throw new ApiError(res.status, (body as ApiErrorBody).error ?? "Request failed");

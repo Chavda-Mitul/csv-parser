@@ -9,6 +9,7 @@ import { connectDB } from "./db/pool.js";
 import { boss } from "./db/pgBoss.js";
 import { registerUploadOrdersWorker } from "./jobs/uploadOrders.job.js";
 import { ordersRouter } from "./routes/orders.routes.js";
+import { apiKeyAuth } from "./middleware/apiKeyAuth.js";
 import { notFoundHandler, errorHandler } from "./middleware/errorHandler.js";
 import { registerShutdownHandlers, setServer } from "./shutdown.js";
 
@@ -35,7 +36,7 @@ app.get("/metrics", (_req, res) => {
   res.json(metrics.snapshot());
 });
 
-app.use(ordersRouter);
+app.use(apiKeyAuth, ordersRouter);
 
 app.use(notFoundHandler);
 app.use(errorHandler);
