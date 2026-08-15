@@ -77,24 +77,34 @@ order_date DESC)`. `GET /orders/:orderId` can't know which shard holds an order,
 scatter-gathers — queries every shard pool in parallel via `Promise.all` and takes the one match
 (cheap at N=3, would need a shard-lookup index at much larger N).
 
-### Ingestion pipeline (`POST /upload-orders` + async job)
+### Ingestion pipeline (`POST /upload-orders/init` + `/complete` + async job)
 
-`POST /upload-orders` only *stages* the upload: Busboy parses the multipart request, validates the
-file info (`fileInfoSchema`, zod) and 500MB size limit, and streams the raw bytes to a temp file on
-disk. As soon as that write finishes it enqueues a pg-boss job (`upload-orders` queue,
-`src/jobs/uploadOrders.job.ts`) with the temp file path, and responds `202 { jobId }` — it does not
-wait for GCS backup, CSV parsing, or any DB writes.
+Cloud Run hard-caps request bodies at 32MiB, so the file is never streamed through this service
+(the old Busboy/temp-file version is in git history only). Instead it's a three-step, direct-to-GCS
+flow:
 
-The actual ingestion work runs in `ingestOrdersFile()` (`src/services/ordersIngest.service.ts`),
-called from the pg-boss worker (registered in-process via `registerUploadOrdersWorker()`, alongside
-`app.listen` in `server.ts`) against `fs.createReadStream(tempFilePath)`. It tees that stream into
-two `PassThrough` branches:
+1. `POST /upload-orders/init` (`initUpload`, `uploadOrders.controller.ts`) validates the file info
+   (`initUploadSchema`, zod) and mints a short-lived (15 min) v4 signed GCS URL for
+   `staging/<uuid>-<filename>`, returning `{ uploadUrl, stagingPath }`.
+2. The browser `PUT`s the file bytes **directly to `storage.googleapis.com`**, bypassing the
+   backend entirely (`src/frontend/src/api/client.ts`).
+3. `POST /upload-orders/complete` (`completeUpload`) enqueues a pg-boss job (`upload-orders` queue,
+   `src/jobs/uploadOrders.job.ts`) with `{ stagingPath, filename, mimeType }` — just a GCS pointer,
+   no file data — and responds `202 { jobId }`.
 
-- **Branch A** → piped to a GCS write stream (raw file backup), with a first-chunk null-byte sniff
-  to reject non-CSV binary uploads.
-- **Branch B** → piped through `fast-csv`'s streaming parser, each row validated against
-  `orderRowSchema` (`src/validation/orderRow.ts`, zod). Invalid rows are skipped and recorded in
-  `rowErrors` (not written to the DLQ — the response payload *is* the DLQ), not thrown.
+The actual ingestion work runs in the pg-boss worker (`registerUploadOrdersWorker()`, registered
+in-process alongside `app.listen` in `server.ts`). It re-checks the staged object's real size
+against `MAX_FILE_BYTES` (500MB) via `stagingFile.getMetadata()` — the client-declared size from
+`init` is untrusted — then calls `ingestOrdersFile()` (`src/services/ordersIngest.service.ts`)
+with the staged GCS `File` object. Since the upload already lives in GCS (the client PUT it there
+directly), the permanent backup is a **server-side GCS copy** (`sourceFile.copy(destFile)` to
+`orders/<uuid>-<filename>`) — no bytes round-trip through the worker — run via `Promise.all`
+alongside a single read stream that's piped through `fast-csv`'s parser, with a first-chunk
+null-byte sniff on that same stream to reject non-CSV binary uploads. Each row is validated against
+`orderRowSchema` (`src/validation/orderRow.ts`, zod); invalid rows are skipped and recorded in
+`rowErrors` (not written to the DLQ — the response payload *is* the DLQ), not thrown. If either the
+copy or the parse/ingest side fails, the permanent backup object is best-effort deleted so it
+doesn't linger orphaned.
 
 Valid rows go into `ShardBufferManager` (`src/services/shardBuffer.service.ts`), which buffers
 per-shard batches of `BATCH_SIZE` (500) and bulk-inserts via a single parameterized
@@ -104,12 +114,14 @@ backpressure — the CSV stream is `pause()`d and only `resume()`d once that sha
 (`needsBackpressure` / `waitFor`), so per-shard buffers can't grow unbounded while a shard is slow.
 
 `ingestOrdersFile()` resolves with `{ file, totalRows, successfulRows, failedRows, rowErrors }`,
-which pg-boss stores as the job's `output`. The temp file is unlinked in a `finally` once the job
-settles either way. The `upload-orders` queue is created with `retryLimit: 0` (via `createQueue` +
-`updateQueue`, so it applies even if the queue already existed with different settings) —
-ingestion failures like a malformed CSV are deterministic on the same staged file and the temp file
-is already gone after the first attempt, so a retry would just fail again with a misleading
-"file not found" instead of the real error.
+which pg-boss stores as the job's `output`. The `staging/` object is deleted in a `finally` once
+the job settles either way — a crash between `complete` and that `finally` orphans the staging
+object (no bucket lifecycle rule visible for the `staging/` prefix). The `upload-orders` queue is
+created with `retryLimit: 0` (via `createQueue` + `updateQueue`, so it applies even if the queue
+already existed with different settings) — ingestion failures like a malformed CSV are
+deterministic on the same staged file, so a retry would just fail again the same way; note this
+also means a worker crash mid-job (not a thrown error) isn't retried either, since pg-boss has no
+visible job-expiry config here to notice the worker died.
 
 `GET /upload-orders/:jobId` (`getUploadJob.controller.ts`) polls job state via
 `boss.getJobById()`: `processing` while active/queued, `done` with the ingestion result once
@@ -133,8 +145,9 @@ via `serialize-error`) once `failed`/`cancelled`.
 ### Frontend
 
 Vite + React 19 + MUI, talking to the backend via `src/frontend/src/api/client.ts`. Key pieces:
-`UploadWorkspace`/`Dropzone` for the CSV upload flow — `UploadWorkspace` posts the file, then polls
-`GET /upload-orders/:jobId` on a flat 2s interval until the job is `done`/`error` — `MetricsSummary`/
+`UploadWorkspace`/`Dropzone` for the CSV upload flow — `UploadWorkspace` calls `init`, `PUT`s the
+file straight to the signed GCS URL, calls `complete`, then polls `GET /upload-orders/:jobId` on a
+flat 2s interval until the job is `done`/`error` — `MetricsSummary`/
 `ErrorLogTable` for rendering the final ingestion result (`totalRows`/`successfulRows`/
 `failedRows`/`rowErrors`), `QueryWorkspace` for the customer/order-id lookup endpoints.
 `src/frontend/src/lib/crc32.ts` mirrors the backend's shard-hash client-side (e.g. for showing

@@ -9,11 +9,6 @@ import { UPLOAD_ORDERS_QUEUE } from "../jobs/uploadOrders.job.js";
 
 const SIGNED_URL_TTL_MS = 15 * 60 * 1000;
 
-// Cloud Run hard-caps request bodies at 32MiB, so the file can't be streamed through this
-// service (see the old Busboy-based version in git history). Instead the browser uploads
-// directly to GCS via a short-lived signed URL: initUpload mints the URL, the client PUTs
-// the file straight to storage.googleapis.com, then completeUpload enqueues ingestion —
-// mirroring what the old streaming handler did once the upload finished.
 export const initUpload = asyncHandler(async (req, res) => {
   const parsed = initUploadSchema.safeParse(req.body);
   if (!parsed.success) {

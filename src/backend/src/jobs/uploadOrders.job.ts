@@ -22,7 +22,12 @@ export async function registerUploadOrdersWorker() {
   await boss.createQueue(UPLOAD_ORDERS_QUEUE, { retryLimit: 0 });
   await boss.updateQueue(UPLOAD_ORDERS_QUEUE, { retryLimit: 0 });
 
-  await boss.work<UploadOrdersJobData>(UPLOAD_ORDERS_QUEUE, async (jobs) => {
+  // localConcurrency: 5 — lets this instance process up to 5 upload jobs at once instead
+  // of pg-boss's default of 1. Ingestion is I/O-bound (GCS reads, Postgres writes), so
+  // concurrent jobs interleave during each other's network waits rather than competing for
+  // CPU. Paired with each shard pool's connection limit (`pool.ts`) — don't raise this
+  // without also checking pool size, or jobs just queue for a DB connection instead.
+  await boss.work<UploadOrdersJobData>(UPLOAD_ORDERS_QUEUE, { localConcurrency: 5 }, async (jobs) => {
     const job = jobs[0];
     if (!job) return;
     const { stagingPath, filename, mimeType } = job.data;
@@ -36,10 +41,7 @@ export async function registerUploadOrdersWorker() {
         throw new AppError(413, `File exceeds maximum size of ${MAX_FILE_BYTES} bytes`);
       }
 
-      return await ingestOrdersFile(stagingFile.createReadStream(), {
-        filename,
-        mimeType,
-      });
+      return await ingestOrdersFile(stagingFile, { filename, mimeType });
     } finally {
       await stagingFile
         .delete()

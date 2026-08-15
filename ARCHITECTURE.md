@@ -17,8 +17,8 @@ The design optimizes for three properties simultaneously:
 
 | Property | Mechanism |
 |---|---|
-| **Constant memory footprint** | Node streams end-to-end: multipart parse → tee → GCS write / CSV parse → per-shard batch buffer. No full-file buffering at any stage. |
-| **Non-blocking ingestion** | `POST /upload-orders` only stages the file and enqueues a background job (pg-boss); the actual parse/validate/insert work runs asynchronously and is polled for completion. |
+| **Constant memory footprint** | The browser uploads straight to GCS via a signed URL (no file bytes touch the API process); the worker streams the staged object through CSV parse → per-shard batch buffer, with the permanent backup done as a server-side GCS copy. No full-file buffering at any stage. |
+| **Non-blocking ingestion** | `POST /upload-orders/init` + `/complete` only stage the file and enqueue a background job (pg-boss); the actual parse/validate/insert work runs asynchronously and is polled for completion. |
 | **Horizontal write scaling** | Rows are routed to one of `N` independent Postgres shards by `CRC32(customer_id) % N`, so write throughput scales by adding shards, not by scaling a single instance. |
 
 ---
@@ -31,31 +31,35 @@ The design optimizes for three properties simultaneously:
 sequenceDiagram
     participant Client
     participant API as Express API
-    participant Disk as Temp File
+    participant GCS as GCS Bucket
     participant Queue as pg-boss (postgres_jobs)
     participant Worker as Ingestion Worker
-    participant GCS as GCS Bucket
     participant Shards as Postgres Shards (1..N)
 
-    Client->>API: POST /upload-orders (multipart CSV)
-    API->>API: Busboy parse + fileInfoSchema validation + 500MB limit
-    API->>Disk: stream raw bytes to temp file
-    API->>Queue: enqueue "upload-orders" job {tempFilePath}
+    Client->>API: POST /upload-orders/init {filename, mimeType}
+    API->>API: initUploadSchema validation
+    API->>GCS: mint v4 signed URL for staging/<uuid>-<filename>
+    API-->>Client: 200 { uploadUrl, stagingPath }
+
+    Client->>GCS: PUT file bytes directly to signed URL
+
+    Client->>API: POST /upload-orders/complete {stagingPath, filename, mimeType}
+    API->>Queue: enqueue "upload-orders" job {stagingPath}
     API-->>Client: 202 { jobId }
 
     Queue->>Worker: deliver job
-    Worker->>Disk: fs.createReadStream(tempFilePath)
-    Worker->>Worker: tee into Branch A / Branch B (PassThrough)
+    Worker->>GCS: getMetadata() — re-check real size vs MAX_FILE_BYTES
 
-    par Branch A — raw backup
-        Worker->>GCS: pipe raw bytes to write stream
-    and Branch B — parse & validate
+    par server-side copy — permanent backup
+        Worker->>GCS: sourceFile.copy(orders/<uuid>-<filename>)
+    and parse & validate — single read stream
+        Worker->>GCS: createReadStream(staging/<uuid>-<filename>)
         Worker->>Worker: fast-csv parse, row → orderRowSchema
         Worker->>Worker: buffer valid rows per shard (ShardBufferManager)
         Worker->>Shards: batched INSERT ... ON CONFLICT DO NOTHING (500/batch)
     end
 
-    Worker->>Disk: unlink temp file (finally)
+    Worker->>GCS: delete staging object (finally)
     Worker-->>Queue: job output {totalRows, successfulRows, failedRows, rowErrors, file}
 
     Client->>API: GET /upload-orders/:jobId (poll every 2s)
@@ -72,7 +76,8 @@ flowchart LR
     end
 
     subgraph API_Process["Node.js API Process"]
-        EP1[POST /upload-orders]
+        EP0[POST /upload-orders/init]
+        EP1[POST /upload-orders/complete]
         EP2[GET /upload-orders/:jobId]
         EP3[GET /orders/:orderId]
         EP4[GET /orders?customerId=]
@@ -81,12 +86,15 @@ flowchart LR
     end
 
     JobsDB[(postgres_jobs\npg-boss schema)]
-    GCS[(GCS Bucket\nraw CSV backup)]
+    GCS[(GCS Bucket\nstaging/ + orders/)]
     S1[(postgres_shard_1)]
     S2[(postgres_shard_2)]
     S3[(postgres_shard_3)]
 
-    UI -->|multipart upload| EP1
+    UI -->|1: request signed URL| EP0
+    EP0 -->|mint v4 signed URL| GCS
+    UI -->|2: PUT file directly| GCS
+    UI -->|3: confirm upload| EP1
     UI -->|poll| EP2
     UI -->|lookup by id| EP3
     UI -->|lookup by customer| EP4
@@ -204,37 +212,51 @@ every ID lookup.
 
 ## 4. Ingestion Pipeline Detail
 
-### 4.1 Stage 1 — staging (`POST /upload-orders`, synchronous)
+### 4.1 Stage 1 — staging (`POST /upload-orders/init` + client PUT + `POST /upload-orders/complete`)
 
-1. `validateUpload` middleware rejects non-`multipart/form-data` requests (`400`).
-2. Busboy parses the multipart body with `{ files: 1, fileSize: 50 * 1024 * 1024 }` limits.
-3. The file part is validated against `fileInfoSchema` (filename must end in `.csv`; MIME
-   type in `{text/csv, application/vnd.ms-excel, application/csv}`) — `400` on mismatch.
-4. Raw bytes are streamed directly to `os.tmpdir()/upload-<uuid>-<filename>` — never
-   buffered fully in process memory.
-5. On write completion, a pg-boss job is enqueued on the `upload-orders` queue with
-   `{ tempFilePath, filename, mimeType }`.
-6. The request returns immediately: **`202 { jobId }`**.
+Cloud Run hard-caps request bodies at 32MiB, so the file is never streamed through the API
+process — the old Busboy/temp-file design (still described by some in-repo history) was
+replaced with a direct-to-GCS, three-step flow:
+
+1. **`POST /upload-orders/init`** — validates `{ filename, mimeType }` against
+   `initUploadSchema` (`400` on mismatch), then mints a v4 signed GCS URL (15 min TTL) for
+   `staging/<uuid>-<filename>` and returns `200 { uploadUrl, stagingPath }`. No file bytes
+   are involved yet.
+2. **Client `PUT`s the file directly to `storage.googleapis.com`** using `uploadUrl` — this
+   traffic never touches the Express process.
+3. **`POST /upload-orders/complete`** — validates `{ stagingPath, filename, mimeType }`
+   against `completeUploadSchema`, enqueues a pg-boss job on the `upload-orders` queue with
+   `{ stagingPath, filename, mimeType }` (a GCS pointer, not file data), and returns
+   immediately: **`202 { jobId }`**.
 
 ### 4.2 Stage 2 — background ingestion (`ingestOrdersFile`, async worker)
 
 Runs in-process via a pg-boss worker (`registerUploadOrdersWorker()`, started alongside
-`app.listen`), reading the staged file with `fs.createReadStream`.
+`app.listen`). Before touching the file, it re-checks the staged object's **real** size via
+`stagingFile.getMetadata()` against `MAX_FILE_BYTES` (500MB) — the size the client declared
+at `init` time is untrusted, since the client controls what it PUTs.
 
-The read stream is **teed** into two `PassThrough` branches so the raw backup and the
-parse/validate/insert path run concurrently off a single disk read:
+The staged file already lives durably in GCS (the client put it there), so there's no need
+to tee a single read stream the way a synchronous-upload design would: the permanent backup
+is a **server-side GCS copy** (`sourceFile.copy(destFile)` to `orders/<uuid>-<filename>`) —
+no bytes round-trip through the worker process — run via `Promise.all` alongside a single
+read stream dedicated to parsing:
 
-- **Branch A — GCS backup.** Piped to a GCS write stream at
-  `orders/<uuid>-<filename>` in the configured bucket. The first data chunk is sniffed for
-  a null byte in its first 512 bytes; if found, both branches are destroyed and the job
-  fails with `400 "File does not appear to be a valid CSV"` — a cheap guard against binary
-  files masquerading as `.csv`.
-- **Branch B — parse & validate.** Streamed through `fast-csv`'s parser
-  (`{ headers: true }`). Each row is validated against `orderRowSchema` (zod: trimmed
+- **Server-side copy — permanent backup.** `sourceFile.copy(destFile)`. Google Cloud
+  Storage performs this entirely on its own infrastructure; the worker just waits on the
+  promise.
+- **Parse & validate — single read stream.** `sourceFile.createReadStream()` piped through
+  `fast-csv`'s parser (`{ headers: true }`). The first data chunk is sniffed for a null byte
+  in its first 512 bytes; if found, the parse stream is destroyed and the job fails with
+  `400 "File does not appear to be a valid CSV"` — a cheap guard against binary files
+  masquerading as `.csv`. Each row is validated against `orderRowSchema` (zod: trimmed
   non-empty `order_id`/`customer_id`, coerced positive `order_amount`, coerced
   `order_date`, `status` defaulting to `PENDING`). Invalid rows are **skipped, not
   thrown** — recorded as `{ row, reason }` in `rowErrors`. The failed-row list *is* the
   dead-letter record; there's no separate DLQ store.
+
+If either side fails, the (possibly partial) permanent backup object is deleted best-effort
+so a failed job doesn't leave an orphaned `orders/` object behind.
 
 Valid rows are handed to `ShardBufferManager`:
 
@@ -259,8 +281,7 @@ Valid rows are handed to `ShardBufferManager`:
 - On stream end, `flushAll()` awaits any in-flight flush per shard, then flushes whatever
   remains buffered.
 
-The job resolves once **both** branches finish (GCS write `finish` + CSV `end` +
-`flushAll()`), producing:
+The job resolves once **both** the copy and `flushAll()` (after CSV `end`) settle, producing:
 
 ```ts
 type UploadResult = {
@@ -272,16 +293,17 @@ type UploadResult = {
 };
 ```
 
-The temp file is `unlink`ed in a `finally` block regardless of outcome.
+The `staging/` object is deleted in a `finally` block once the job settles either way.
 
 ### 4.3 Why `retryLimit: 0`
 
 The `upload-orders` pg-boss queue is created (and re-asserted via `updateQueue`, since
 `createQueue` options only apply the first time a queue is created) with `retryLimit: 0`.
-Ingestion failures are deterministic given the same staged file, and the temp file is
-already deleted after the first attempt — a retry would fail again, but with a misleading
-"file not found" instead of the actual root cause. Zero retries surfaces the real error
-once, cleanly.
+Ingestion failures are deterministic given the same staged file, so a retry would just fail
+the same way again. This also means a worker crash mid-job (as opposed to a thrown error)
+isn't retried either — there's no visible pg-boss job-expiry config here that would notice
+the worker died and requeue the job, so a crash mid-processing can leave a job stuck
+`active` and its staging object un-deleted until it's manually cleaned up.
 
 ### 4.4 Job polling contract
 
@@ -300,7 +322,7 @@ once, cleanly.
 
 | Concern | Approach |
 |---|---|
-| **Memory** | Every stage is a stream: HTTP body → temp file → tee → GCS write / CSV parse → bounded per-shard row buffers (≤1000 rows/shard at any instant). No full-file or full-result-set buffering. |
+| **Memory** | File bytes never enter the API process — the browser PUTs straight to GCS. The worker streams the staged object through CSV parse → bounded per-shard row buffers (≤1000 rows/shard at any instant), while the permanent backup is a server-side GCS copy. No full-file or full-result-set buffering. |
 | **Write throughput** | Multi-row parameterized `INSERT ... ON CONFLICT DO NOTHING`, batched at 500 rows, one round-trip per batch per shard instead of per-row inserts. |
 | **Backpressure** | Per-shard in-flight flush tracking pauses the source stream only when a shard actually falls behind, rather than throttling globally. |
 | **Idempotency** | `ON CONFLICT (order_id) DO NOTHING` — safe to re-run the same upload. |
@@ -364,10 +386,15 @@ project.
 
 ### 7.2 Upload pipeline security
 
-- 500MB hard cap on upload size, enforced by Busboy before any parsing begins.
-- MIME type + filename extension checked before the file is persisted to disk.
+- 500MB cap on upload size — re-checked server-side against the staged object's actual GCS
+  metadata (`getMetadata()`) at worker time, since the size declared by the client at `init`
+  is untrusted.
+- MIME type + filename extension checked (`initUploadSchema`/`completeUploadSchema`) before
+  a signed URL is minted and before the job is enqueued.
+- Signed upload URLs are short-lived (15 min) and scoped to a single `staging/<uuid>-...`
+  object — not a general-purpose bucket-write credential.
 - Magic-byte (null-byte) sniff rejects binary payloads disguised as `.csv` before they're
-  fully written or parsed.
+  fully parsed.
 - All row data reaches the database only through parameterized queries — no
   string-interpolated SQL in the ingestion or query paths (the one exception is the
   operator-only `queryShards.ts` CLI script, discussed below, which is not exposed via
@@ -377,16 +404,27 @@ project.
 
 ## 8. API Reference
 
-### `POST /upload-orders`
+### `POST /upload-orders/init`
 
-Multipart file upload. Stages the file and enqueues ingestion; does not wait for it.
+Mints a short-lived signed GCS URL for the client to upload directly to.
 
-- **Request:** `multipart/form-data`, one file field, `.csv` filename + CSV-compatible MIME type, ≤500MB.
+- **Request:** `{ "filename": string, "mimeType": string }` — `.csv` filename + CSV-compatible MIME type.
+- **Response `200`:**
+  ```json
+  { "uploadUrl": "https://storage.googleapis.com/...", "stagingPath": "staging/9f2c1e0a-orders.csv" }
+  ```
+- **Errors:** `400` (invalid filename/MIME type).
+
+### `POST /upload-orders/complete`
+
+Confirms the client's direct-to-GCS upload finished and enqueues ingestion; does not wait for it.
+
+- **Request:** `{ "stagingPath": string, "filename": string, "mimeType": string }` — `stagingPath` as returned by `init`.
 - **Response `202`:**
   ```json
   { "jobId": "9f2c1e0a-..." }
   ```
-- **Errors:** `400` (bad content-type / missing or invalid file / malformed multipart), `413` (>500MB), `500` (staging/enqueue failure).
+- **Errors:** `400` (invalid request body), `500` (enqueue failure). Actual file-size enforcement (`413`, >500MB) happens server-side in the worker against the real GCS object size, not at this endpoint.
 
 ### `GET /upload-orders/:jobId`
 
@@ -520,9 +558,10 @@ Operator tool only — not parameterized, not exposed over HTTP.
 | Decision | Alternative considered | Why this was chosen |
 |---|---|---|
 | Application-level `CRC32(customer_id) % N` sharding | Postgres declarative partitioning / consistent hashing ring | Simple, dependency-free (Node stdlib `zlib`), keeps a customer's orders co-located on one shard for the primary read path; re-sharding cost accepted as reasonable at fixed, assessment-scale `N` |
-| Stream-tee (GCS backup + CSV parse in parallel) | Parse first, then upload; or upload first, then download to parse | Single disk read drives both branches concurrently — avoids double I/O and keeps memory flat regardless of file size |
+| Direct-to-GCS signed-URL upload (`init`/`complete`) | Stream the file through the API (old Busboy/temp-file design) | Cloud Run hard-caps request bodies at 32MiB — files couldn't be streamed through the API process at all; the client PUTs straight to GCS instead |
+| Server-side GCS copy for the permanent backup, in parallel with a single parse stream | Tee one read stream into a GCS write + CSV parse (viable when the API read the bytes off the wire itself) | The file already lives durably in GCS once staged — re-streaming it through the worker just to write it back would be a redundant download+upload round trip; `File.copy()` runs entirely on GCS's side |
 | Background job via pg-boss, not synchronous ingestion | Ingest inline within the HTTP request | 10k+ row files would otherwise hold the request open for the full parse/validate/insert duration; decoupling keeps the upload endpoint fast and poll-based status is simpler than long-lived connections/websockets |
 | Per-shard bounded buffer + real backpressure | Unbounded per-shard queue | Prevents one slow shard from causing unbounded memory growth while letting fast shards keep flushing independently |
-| `retryLimit: 0` on the ingestion queue | Default pg-boss retries | Ingestion failures are deterministic given the same (now-deleted) temp file; retrying just reproduces a misleading error instead of the real one |
+| `retryLimit: 0` on the ingestion queue | Default pg-boss retries | Ingestion failures are deterministic given the same staged file; retrying just reproduces the same error |
 | `ON CONFLICT (order_id) DO NOTHING` | Fail the batch on duplicate key | Makes re-uploading the same file a safe, idempotent no-op for already-ingested rows |
 | Scatter-gather for `GET /orders/:orderId` | A dedicated shard-lookup index/table | `order_id` carries no shard information and a lookup table adds write-path complexity not justified at `N=3`; acceptable fan-out cost at this scale |

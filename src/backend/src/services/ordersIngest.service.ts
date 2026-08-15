@@ -1,5 +1,5 @@
 import { randomUUID } from "crypto";
-import { PassThrough, Readable } from "stream";
+import type { File } from "@google-cloud/storage";
 import { parse } from "fast-csv";
 import { bucket } from "../gcloud/bucket.js";
 import { logger } from "../logger.js";
@@ -21,41 +21,26 @@ export interface UploadResult {
   rowErrors: RowError[];
 }
 
-// Lifted from the old synchronous uploadOrders.controller.ts: tee to GCS + CSV parse,
-// validate rows, buffer/flush across shards. Now driven by any Readable (Busboy stream
-// or, since uploads are staged to disk before queuing, fs.createReadStream) so the same
-// pipeline runs identically whether called inline or from the pg-boss job handler.
-export function ingestOrdersFile(
-  fileStream: Readable,
-  info: { filename: string; mimeType: string },
-): Promise<UploadResult> {
-  return new Promise((resolve, reject) => {
-    const { filename, mimeType } = info;
-    metrics.increment("uploadsStarted");
-    logger.info({ filename, mimeType }, "Order file upload started");
+interface ParseResult {
+  totalRows: number;
+  successfulRows: number;
+  failedRows: number;
+  rowErrors: RowError[];
+}
 
+// Parses/validates the staged CSV and buffers valid rows out to shards.
+function parseAndIngest(sourceFile: File): Promise<ParseResult> {
+  return new Promise((resolve, reject) => {
     let settled = false;
     const settle = (fn: () => void) => {
       if (settled) return;
       settled = true;
       fn();
     };
+    const fail = (error: AppError) => settle(() => reject(error));
 
-    const failUpload = (error: AppError) => {
-      metrics.increment("uploadsFailed");
-      settle(() => reject(error));
-    };
-
-    const destination = `orders/${randomUUID()}-${filename}`;
-    const gcsFile = bucket.file(destination);
-    const gcsStream = gcsFile.createWriteStream({ contentType: mimeType });
-
-    const branchA = new PassThrough();
-    const branchB = new PassThrough();
-    fileStream.pipe(branchA);
-    fileStream.pipe(branchB);
-
-    const csvStream = branchB.pipe(parse({ headers: true }));
+    const fileStream = sourceFile.createReadStream();
+    const csvStream = fileStream.pipe(parse({ headers: true }));
     let totalRows = 0;
     let successfulRows = 0;
     let failedRows = 0;
@@ -67,19 +52,15 @@ export function ingestOrdersFile(
       if (checkedMagic) return;
       checkedMagic = true;
       if (chunk.subarray(0, 512).includes(0)) {
-        gcsStream.destroy();
         csvStream.destroy();
-        failUpload(
-          new AppError(400, "File does not appear to be a valid CSV"),
-        );
+        fail(new AppError(400, "File does not appear to be a valid CSV"));
       }
     });
 
     fileStream.on("error", (error) => {
       logger.error(error, "Failed to read staged upload file");
-      gcsStream.destroy();
       csvStream.destroy();
-      failUpload(new AppError(500, "Failed to read staged upload file"));
+      fail(new AppError(500, "Failed to read staged upload file"));
     });
 
     csvStream.on("data", (row) => {
@@ -99,9 +80,8 @@ export function ingestOrdersFile(
 
       const handleFlushError = (error: unknown) => {
         logger.error(error, "Failed to bulk insert order batch");
-        gcsStream.destroy();
         csvStream.destroy();
-        failUpload(new AppError(502, "Failed to write orders to database"));
+        fail(new AppError(502, "Failed to write orders to database"));
       };
 
       if (shardBuffers.isFull(targetShardIdx)) {
@@ -119,54 +99,57 @@ export function ingestOrdersFile(
       }
     });
 
-    let gcsDone = false;
-    let csvDone = false;
-    const maybeFinish = () => {
-      if (!gcsDone || !csvDone) return;
-      settle(() => {
-        const url = gcsFile.publicUrl();
-        metrics.increment("uploadsSucceeded");
-        metrics.increment("rowsIngested", successfulRows);
-        metrics.increment("rowsFailed", failedRows);
-        logger.info(
-          { destination, url, totalRows, successfulRows, failedRows },
-          "Order file uploaded",
-        );
-        resolve({ file: url, totalRows, successfulRows, failedRows, rowErrors });
-      });
-    };
-
-    gcsStream.on("error", (error) => {
-      logger.error(error, "Failed to upload file to GCS");
-      csvStream.destroy();
-      failUpload(new AppError(502, "Failed to store file"));
-    });
-
     csvStream.on("error", (error) => {
       logger.error(error, "Failed to parse CSV file");
-      gcsStream.destroy();
-      failUpload(new AppError(400, "Malformed CSV file"));
-    });
-
-    gcsStream.on("finish", () => {
-      gcsDone = true;
-      maybeFinish();
+      fail(new AppError(400, "Malformed CSV file"));
     });
 
     csvStream.on("end", () => {
       shardBuffers
         .flushAll()
-        .then(() => {
-          csvDone = true;
-          maybeFinish();
-        })
+        .then(() => settle(() => resolve({ totalRows, successfulRows, failedRows, rowErrors })))
         .catch((error: unknown) => {
           logger.error(error, "Failed to flush final order batch");
-          gcsStream.destroy();
-          failUpload(new AppError(502, "Failed to write orders to database"));
+          fail(new AppError(502, "Failed to write orders to database"));
         });
     });
-
-    branchA.pipe(gcsStream);
   });
+}
+
+// The staged upload already lives in GCS (client PUT it there via a signed URL), so the
+// permanent backup is a server-side copy — no bytes round-trip through this process — run
+// in parallel with CSV parsing/validation/shard writes off the same staged object.
+export async function ingestOrdersFile(
+  sourceFile: File,
+  info: { filename: string; mimeType: string },
+): Promise<UploadResult> {
+  const { filename, mimeType } = info;
+  metrics.increment("uploadsStarted");
+  logger.info({ filename, mimeType }, "Order file upload started");
+
+  const destination = `orders/${randomUUID()}-${filename}`;
+  const destFile = bucket.file(destination);
+
+  try {
+    const [, parseResult] = await Promise.all([
+      sourceFile.copy(destFile).catch((error: unknown) => {
+        logger.error(error, "Failed to copy file to permanent storage");
+        throw new AppError(502, "Failed to store file");
+      }),
+      parseAndIngest(sourceFile),
+    ]);
+
+    const url = destFile.publicUrl();
+    metrics.increment("uploadsSucceeded");
+    metrics.increment("rowsIngested", parseResult.successfulRows);
+    metrics.increment("rowsFailed", parseResult.failedRows);
+    logger.info({ destination, url, ...parseResult }, "Order file uploaded");
+    return { file: url, ...parseResult };
+  } catch (error) {
+    metrics.increment("uploadsFailed");
+    await destFile.delete().catch(() => {
+      // best-effort cleanup of a partial/orphaned backup
+    });
+    throw error;
+  }
 }
